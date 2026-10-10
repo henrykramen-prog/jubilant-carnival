@@ -319,13 +319,20 @@
       function isNs(url) {
         return /\/ns(?:\?|$)/.test(String(url || ''));
       }
+      function isPxHost(url) {
+        try {
+          var h = new URL(url, location.href).hostname.toLowerCase();
+          if (h === 'ift.px-cloud.net') return true;
+          return /^collector-[a-z0-9]+\.(px-cloud|px-cdn|pxcdn|pxchk)\.net$/.test(h);
+        } catch (e) { return false; }
+      }
       function needsProxy(url) {
         var abs = String(url || '');
         try { abs = new URL(abs, location.href).href; } catch (e) { return false; }
-        if (!/^https:\/\//i.test(abs)) return false;
+        if (!/^https:\/\//i.test(abs) || !isPxHost(abs)) return false;
         if (/\/api\/v2\/collector/.test(abs)) return true;
-        if (/\/b\/s(?:\?|$|\/)/.test(abs) && /px-(cdn|chk|cloud)\.net/i.test(abs)) return true;
-        if (isNs(abs) && /px-cloud\.net/i.test(abs)) return true;
+        if (/\/b\/s(?:\?|$|\/)/.test(abs)) return true;
+        if (isNs(abs)) return true;
         return false;
       }
       function isCollector(url) {

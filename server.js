@@ -8429,7 +8429,7 @@ function requestUrl(req) {
   const host = req.headers.host || `127.0.0.1:${PORT}`;
   return new URL(req.url || "/", `http://${host}`);
 }
-var PX_PROXY_HOST = /^(collector-[a-z0-9]+\.(px-cloud|px-cdn|pxchk)\.net|ift\.px-cloud\.net)$/i;
+var PX_PROXY_HOST = /^(collector-[a-z0-9]+\.(px-cloud|px-cdn|pxcdn|pxchk)\.net|ift\.px-cloud\.net)$/i;
 function allowedPxUrl(raw) {
   try {
     const u = new URL(raw);

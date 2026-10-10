@@ -3,7 +3,8 @@
     { "source": "/capture", "destination": "/api/handler" },
     { "source": "/ns", "destination": "/api/handler" },
     { "source": "/main.min.js", "destination": "/api/handler" },
-    { "source": "/status", "destination": "/api/handler" }
+    { "source": "/status", "destination": "/api/handler" },
+    { "source": "/px-proxy", "destination": "/api/handler" }
   ],
   "functions": {
     "api/handler.js": {
