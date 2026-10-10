@@ -1,0 +1,7 @@
+{
+  "name": "3layerdip",
+  "private": true,
+  "dependencies": {
+    "@upstash/redis": "^1.34.3"
+  }
+}

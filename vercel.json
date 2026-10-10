@@ -1,0 +1,14 @@
+{
+  "rewrites": [
+    { "source": "/capture", "destination": "/api/handler" },
+    { "source": "/ns", "destination": "/api/handler" },
+    { "source": "/main.min.js", "destination": "/api/handler" },
+    { "source": "/status", "destination": "/api/handler" }
+  ],
+  "functions": {
+    "api/handler.js": {
+      "maxDuration": 60,
+      "includeFiles": "{server.js,capture-store.js}"
+    }
+  }
+}

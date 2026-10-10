@@ -7954,6 +7954,7 @@ var { buildCollectorSequence } = require_sequence();
 var { extractCollectorProfile } = require_collector_profile();
 var { deriveSDKRotation } = require_sdk_rotation();
 var { decryptPayload, computePC } = D;
+var store = require("./capture-store");
 try {
   const envFile = fs.readFileSync(path.join(__dirname, ".env"), "utf8");
   for (const line of envFile.split(/\r?\n/)) {
@@ -7973,12 +7974,8 @@ var TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 var TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 var APP_ID = "PXbf8PROpW";
 var PORT = Number(process.env.PORT) || 3004;
-var LOG_DIR = path.join(__dirname, "live");
+var LOG_DIR = process.env.VERCEL ? path.join("/tmp", "live") : path.join(__dirname, "live");
 var REQUIRED_SEQ = /* @__PURE__ */ new Set(["0", "1"]);
-var visits = /* @__PURE__ */ new Map();
-var pendingResponses = /* @__PURE__ */ new Map();
-var nsByUuid = /* @__PURE__ */ new Map();
-var servedSdk = null;
 var statusLine = "waiting for seq 0 and seq 1";
 function parseForm(body) {
   const order = [];
@@ -8084,13 +8081,15 @@ function sendEnv(seq0, seq1) {
     memory: ref.memory || null
   });
 }
-function bundleFor(visit) {
+async function bundleFor(visit) {
   const seq0 = visit.seq0;
   const seq1 = visit.seq1;
   const env = sendEnv(seq0, seq1);
   const state = obState(seq0, seq1);
+  const servedSdk = await store.getSdk();
   const sdkBody = servedSdk ? servedSdk.body : "";
   const sdkSha = servedSdk ? servedSdk.sha : "";
+  const nsRecord = await store.getNs(visit.uuid);
   const form = seq0 && seq0.form || {};
   let profile = null;
   let profileError = null;
@@ -8107,7 +8106,7 @@ function bundleFor(visit) {
     env,
     form: Object.assign({ uuid: visit.uuid }, form),
     state,
-    ns: nsByUuid.get(visit.uuid) || null,
+    ns: nsRecord || null,
     sourceSlots: profile && profile.slots || {}
   });
   const stateKeyMap = D.deriveStateKeyMap(seq1.events, state);
@@ -8225,22 +8224,22 @@ function sendJson(res, code, obj) {
   });
   res.end(body);
 }
-function visitOf(uuid) {
-  let visit = visits.get(uuid);
+async function visitOf(uuid) {
+  let visit = await store.getVisit(uuid);
   if (!visit) {
     visit = { uuid, sent: false, seq0: null, seq1: null };
-    visits.set(uuid, visit);
+    await store.saveVisit(visit);
   }
   return visit;
 }
 function slot(visit, seq) {
   return seq === "0" ? "seq0" : "seq1";
 }
-function findCapturePart(id) {
-  for (const visit of visits.values()) {
-    if (visit.seq0 && visit.seq0.id === id) return { visit, key: "seq0", part: visit.seq0 };
-    if (visit.seq1 && visit.seq1.id === id) return { visit, key: "seq1", part: visit.seq1 };
-  }
+async function findCapturePart(id) {
+  const visit = await store.findVisitByCaptureId(id);
+  if (!visit) return null;
+  if (visit.seq0 && visit.seq0.id === id) return { visit, key: "seq0", part: visit.seq0 };
+  if (visit.seq1 && visit.seq1.id === id) return { visit, key: "seq1", part: visit.seq1 };
   return null;
 }
 function storeCaptureResponse(part, parsed) {
@@ -8250,10 +8249,10 @@ function storeCaptureResponse(part, parsed) {
   const cookie = response.decoded && response.decoded.cookie;
   console.log(`[response] seq=${part.seq} status=${parsed.status}` + (cookie ? ` ${cookie.name}` : ""));
 }
-function attachPendingResponse(id, visit, key) {
-  const pending = pendingResponses.get(id);
+async function attachPendingResponse(id, visit, key) {
+  const pending = await store.getPending(id);
   if (!pending) return;
-  pendingResponses.delete(id);
+  await store.deletePending(id);
   storeCaptureResponse(visit[key], pending);
 }
 function hasPx3(part) {
@@ -8325,7 +8324,8 @@ async function publish(visit) {
     return;
   }
   visit.sent = true;
-  const doc = bundleFor(visit);
+  await store.saveVisit(visit);
+  const doc = await bundleFor(visit);
   if (doc.derivation_error) console.log(`        sequence: ${doc.derivation_error}`);
   const unresolved = doc.slots && doc.slots._unresolved || [];
   if (unresolved.length) console.log(`        unresolved slots: ${unresolved.join(", ")}`);
@@ -8383,10 +8383,11 @@ function proxyScript(res) {
         "Content-Type": "application/javascript; charset=utf-8",
         "Cache-Control": "no-store"
       });
-      servedSdk = {
+      const servedSdk = {
         body: buf.toString("utf8"),
         sha: crypto.createHash("sha256").update(buf).digest("hex")
       };
+      store.setSdk(servedSdk).catch((e) => console.error("sdk cache:", e.message));
       res.end(buf);
       console.log(`[script] main.min.js ${buf.length} bytes ${servedSdk.sha.slice(0, 12)}`);
     });
@@ -8398,8 +8399,97 @@ function proxyScript(res) {
   });
   req.setTimeout(2e4, () => req.destroy(new Error("timeout")));
 }
+function requestUrl(req) {
+  const host = req.headers.host || `127.0.0.1:${PORT}`;
+  return new URL(req.url || "/", `http://${host}`);
+}
+async function handleApiRequest(req, res) {
+  const url = requestUrl(req);
+  if (req.method === "GET" && url.pathname === "/main.min.js") {
+    proxyScript(res);
+    return;
+  }
+  if (req.method === "GET" && url.pathname === "/status") {
+    const kvOk = store.kvEnabled();
+    sendJson(res, 200, {
+      line: statusLine,
+      kv: kvOk,
+      vercel: Boolean(process.env.VERCEL),
+      capture_ready: !process.env.VERCEL || kvOk
+    });
+    return;
+  }
+  if (req.method === "POST" && url.pathname === "/ns") {
+    try {
+      const parsed = JSON.parse(await readBody(req));
+      if (parsed.uuid) {
+        await store.setNs(parsed.uuid, { body: parsed.body || "", durationMs: parsed.durationMs });
+        console.log(`[ns] ${parsed.uuid} ${Buffer.byteLength(String(parsed.body || ""))} bytes`);
+      }
+      sendJson(res, 200, { ok: true });
+    } catch (e) {
+      sendJson(res, 400, { ok: false, error: e.message });
+    }
+    return;
+  }
+  if (req.method === "POST" && url.pathname === "/capture") {
+    try {
+      const parsed = JSON.parse(await readBody(req));
+      const id = String(parsed.id || crypto.randomUUID());
+      const phase = parsed.phase === "response" ? "response" : "request";
+      if (phase === "request") {
+        const summary = summarize(parsed.body || "", parsed.url || "");
+        if (!summary.keep) {
+          sendJson(res, 200, { ok: true, ignored: true });
+          return;
+        }
+        const visit = await visitOf(summary.uuid);
+        const key = slot(visit, summary.seq);
+        if (visit.sent || visit[key] && visit[key].decrypted) {
+          sendJson(res, 200, { ok: true, ignored: true });
+          return;
+        }
+        if (!visit.headers) {
+          visit.headers = {
+            referer: header(req, "referer"),
+            "user-agent": header(req, "user-agent"),
+            "sec-ch-ua": header(req, "sec-ch-ua"),
+            "sec-ch-ua-mobile": header(req, "sec-ch-ua-mobile"),
+            "sec-ch-ua-platform": header(req, "sec-ch-ua-platform"),
+            "accept-language": header(req, "accept-language")
+          };
+        }
+        visit[key] = Object.assign({ id, response: null, env: parsed.env || null }, summary);
+        await attachPendingResponse(id, visit, key);
+        await store.saveVisit(visit);
+        statusLine = `got seq ${summary.seq}` + (visit.seq0 && visit.seq1 ? ", waiting for replies" : "");
+        console.log(`[capture] seq=${summary.seq} uuid=${summary.uuid} mac=${summary.pcOk ? "ok" : "no"}`);
+        sendJson(res, 200, { ok: true, id });
+        await publish(visit);
+        return;
+      }
+      const hit = await findCapturePart(id);
+      if (!hit) {
+        await store.setPending(id, { status: parsed.status, response: parsed.response });
+        console.log(`[capture] buffered response id=${id.slice(0, 8)} (request not stored yet)`);
+        sendJson(res, 200, { ok: true, id, buffered: true });
+        return;
+      }
+      storeCaptureResponse(hit.part, parsed);
+      await store.saveVisit(hit.visit);
+      sendJson(res, 200, { ok: true, id });
+      await publish(hit.visit);
+    } catch (e) {
+      console.error("capture error:", e.message);
+      sendJson(res, 400, { ok: false, error: e.message });
+    }
+    return;
+  }
+  res.writeHead(404, { "Content-Type": "text/plain" });
+  res.end("not found");
+}
 var server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, `http://127.0.0.1:${PORT}`);
+  const url = requestUrl(req);
   if (req.method === "GET" && url.pathname === "/") {
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
     res.end(fs.readFileSync(path.join(__dirname, "index.html")));
@@ -8442,84 +8532,22 @@ var server = http.createServer(async (req, res) => {
     res.end(fs.readFileSync(path.join(__dirname, "dip-stack.jpg")));
     return;
   }
-  if (req.method === "GET" && url.pathname === "/main.min.js") {
-    proxyScript(res);
-    return;
-  }
-  if (req.method === "GET" && url.pathname === "/status") {
-    sendJson(res, 200, { line: statusLine });
-    return;
-  }
-  if (req.method === "POST" && url.pathname === "/ns") {
-    try {
-      const parsed = JSON.parse(await readBody(req));
-      if (parsed.uuid) {
-        nsByUuid.set(parsed.uuid, { body: parsed.body || "", durationMs: parsed.durationMs });
-        console.log(`[ns] ${parsed.uuid} ${Buffer.byteLength(String(parsed.body || ""))} bytes`);
-      }
-      sendJson(res, 200, { ok: true });
-    } catch (e) {
-      sendJson(res, 400, { ok: false, error: e.message });
-    }
-    return;
-  }
-  if (req.method === "POST" && url.pathname === "/capture") {
-    try {
-      const parsed = JSON.parse(await readBody(req));
-      const id = String(parsed.id || crypto.randomUUID());
-      const phase = parsed.phase === "response" ? "response" : "request";
-      if (phase === "request") {
-        const summary = summarize(parsed.body || "", parsed.url || "");
-        if (!summary.keep) {
-          sendJson(res, 200, { ok: true, ignored: true });
-          return;
-        }
-        const visit = visitOf(summary.uuid);
-        const key = slot(visit, summary.seq);
-        if (visit.sent || visit[key] && visit[key].decrypted) {
-          sendJson(res, 200, { ok: true, ignored: true });
-          return;
-        }
-        if (!visit.headers) {
-          visit.headers = {
-            referer: header(req, "referer"),
-            "user-agent": header(req, "user-agent"),
-            "sec-ch-ua": header(req, "sec-ch-ua"),
-            "sec-ch-ua-mobile": header(req, "sec-ch-ua-mobile"),
-            "sec-ch-ua-platform": header(req, "sec-ch-ua-platform"),
-            "accept-language": header(req, "accept-language")
-          };
-        }
-        visit[key] = Object.assign({ id, response: null, env: parsed.env || null }, summary);
-        attachPendingResponse(id, visit, key);
-        statusLine = `got seq ${summary.seq}` + (visit.seq0 && visit.seq1 ? ", waiting for replies" : "");
-        console.log(`[capture] seq=${summary.seq} uuid=${summary.uuid} mac=${summary.pcOk ? "ok" : "no"}`);
-        sendJson(res, 200, { ok: true, id });
-        publish(visit);
-        return;
-      }
-      const hit = findCapturePart(id);
-      if (!hit) {
-        pendingResponses.set(id, { status: parsed.status, response: parsed.response });
-        console.log(`[capture] buffered response id=${id.slice(0, 8)} (request not stored yet)`);
-        sendJson(res, 200, { ok: true, id, buffered: true });
-        return;
-      }
-      storeCaptureResponse(hit.part, parsed);
-      sendJson(res, 200, { ok: true, id });
-      publish(hit.visit);
-    } catch (e) {
-      console.error("capture error:", e.message);
-      sendJson(res, 400, { ok: false, error: e.message });
-    }
+  if (url.pathname === "/main.min.js" || url.pathname === "/status" || url.pathname === "/capture" || url.pathname === "/ns") {
+    await handleApiRequest(req, res);
     return;
   }
   res.writeHead(404, { "Content-Type": "text/plain" });
   res.end("not found");
 });
-server.listen(PORT, () => {
-  console.log("PX capture");
-  console.log(`open http://localhost:${PORT}`);
-  console.log(telegramConfigured() ? `telegram chat ${TELEGRAM_CHAT_ID}` : "telegram off until TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set");
-  console.log("keeps seq 0 and seq 1 for one uuid, then sends one JSON file");
-});
+module.exports = { handleApiRequest };
+if (require.main === module) {
+  server.listen(PORT, () => {
+    console.log("PX capture");
+    console.log(`open http://localhost:${PORT}`);
+    console.log(telegramConfigured() ? `telegram chat ${TELEGRAM_CHAT_ID}` : "telegram off until TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set");
+    if (process.env.VERCEL && !store.kvEnabled()) {
+      console.log("warning: VERCEL without KV — capture state will not persist across requests");
+    }
+    console.log("keeps seq 0 and seq 1 for one uuid, then sends one JSON file");
+  });
+}
