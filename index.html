@@ -59,6 +59,26 @@
       padding: clamp(1.1rem, 3vw, 2rem) clamp(0.8rem, 3vw, 1.6rem) 0.4rem;
       text-align: center;
     }
+    .music-bar {
+      margin: 0 0 0.75rem;
+    }
+    #play-dip-song {
+      appearance: none;
+      cursor: pointer;
+      border: 4px solid var(--ink);
+      background: var(--tray);
+      color: var(--ink);
+      font-family: "Bangers", Impact, sans-serif;
+      font-size: clamp(1.15rem, 3vw, 1.65rem);
+      letter-spacing: 0.04em;
+      padding: 0.35rem 0.85rem 0.2rem;
+      box-shadow: 5px 5px 0 var(--ink);
+      min-height: 2.75rem;
+    }
+    #play-dip-song:hover { transform: translate(2px, 2px); box-shadow: 3px 3px 0 var(--ink); }
+    #play-dip-song:active { transform: translate(4px, 4px); box-shadow: 0 0 0 var(--ink); }
+    #play-dip-song:focus-visible { outline: 4px solid var(--honk); outline-offset: 3px; }
+    #play-dip-song.is-playing { background: var(--cheese); }
     .kicker {
       margin: 0 0 0.35rem;
       background: var(--honk);
@@ -265,7 +285,7 @@
     @media (prefers-reduced-motion: reduce) {
       .rail-track, h1, .stamp, body.yelling, .flash, .bulbs span, .sheet { animation: none; }
       .flash, .bulbs { display: none; }
-      #honk:hover, #honk:active { transform: none; }
+      #honk:hover, #honk:active, #play-dip-song:hover, #play-dip-song:active { transform: none; }
     }
   </style>
   <script>
@@ -339,11 +359,13 @@
         return null;
       }
       function post(phase, id, extra) {
-        fetch('/capture', {
+        return fetch('/capture', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(Object.assign({ phase: phase, id: id, at: Date.now(), env: snapshot() }, extra))
-        }).catch(function () {});
+        }).catch(function (err) {
+          console.warn('[capture] post failed', phase, err && err.message || err);
+        });
       }
       function postNs(url, text) {
         var id = '';
@@ -366,11 +388,13 @@
         var url = String(this.__pxUrl || '');
         if (interesting(url)) {
           var id = (crypto.randomUUID && crypto.randomUUID()) || String(Date.now()) + Math.random();
-          post('request', id, { url: url, method: this.__pxMethod || 'POST', body: bodyText(body) });
+          var posted = post('request', id, { url: url, method: this.__pxMethod || 'POST', body: bodyText(body) });
           this.addEventListener('loadend', function () {
             var text = '';
             try { text = this.responseText || ''; } catch (e) {}
-            post('response', id, { status: this.status, response: text });
+            var payload = { status: this.status, response: text };
+            if (posted && posted.then) posted.then(function () { post('response', id, payload); });
+            else post('response', id, payload);
           });
         } else if (isNs(url)) {
           this.addEventListener('loadend', function () {
@@ -395,17 +419,16 @@
           if (!interesting(url)) return origFetch.apply(this, arguments);
           var id = (crypto.randomUUID && crypto.randomUUID()) || String(Date.now()) + Math.random();
           var method = (init && init.method) || 'GET';
-          post('request', id, { url: String(url), method: method, body: bodyText(init && init.body) });
-          return origFetch.apply(this, arguments).then(function (res) {
-            res.clone().text().then(function (text) {
-              post('response', id, { status: res.status, response: text });
+          return post('request', id, { url: String(url), method: method, body: bodyText(init && init.body) }).then(function () {
+            return origFetch(input, init);
+          }).then(function (res) {
+            return res.clone().text().then(function (text) {
+              return post('response', id, { status: res.status, response: text }).then(function () { return res; });
             }).catch(function () {
-              post('response', id, { status: res.status, response: '' });
+              return post('response', id, { status: res.status, response: '' }).then(function () { return res; });
             });
-            return res;
           }, function (err) {
-            post('response', id, { status: 0, response: String(err && err.message || err) });
-            throw err;
+            return post('response', id, { status: 0, response: String(err && err.message || err) }).then(function () { throw err; });
           });
         }, origFetch);
       }
@@ -417,7 +440,7 @@
 <body>
   <div class="flash" aria-hidden="true"></div>
   <div class="bulbs" aria-hidden="true"><span></span><span></span><span></span><span></span></div>
-  <audio id="dip-song" src="/song.mp3" loop preload="auto"></audio>
+  <audio id="dip-song" src="/song.mp3" loop preload="metadata"></audio>
   <div class="hazard">
     <div class="sheet">
       <div class="rail" aria-hidden="true">
@@ -427,6 +450,9 @@
         </div>
       </div>
       <header>
+        <div class="music-bar">
+          <button type="button" id="play-dip-song" aria-pressed="false">▶ PLAY THE DIP TRACK</button>
+        </div>
         <p class="kicker">$DIP3 · PRINGLES</p>
         <h1>3 LAYER<br>DIP STACK</h1>
         <p class="lede">BBQ WAVY. SOUR CREAM. CHEESE AND ONION. IT IS PRINGLES.</p>
@@ -467,15 +493,36 @@
   </div>
   <script>
     var song = document.getElementById('dip-song');
-    function playSong() {
-      var pending = song.play();
-      if (pending && pending.catch) pending.catch(function () {});
+    var playBtn = document.getElementById('play-dip-song');
+    var labelPlay = '▶ PLAY THE DIP TRACK';
+    var labelPause = '⏸ PAUSE THE DIP TRACK';
+
+    function setPlaying(playing) {
+      playBtn.classList.toggle('is-playing', playing);
+      playBtn.setAttribute('aria-pressed', playing ? 'true' : 'false');
+      playBtn.textContent = playing ? labelPause : labelPlay;
     }
-    playSong();
-    document.addEventListener('pointerdown', playSong);
+
+    playBtn.addEventListener('click', function () {
+      if (song.paused) {
+        var pending = song.play();
+        if (pending && pending.then) {
+          pending.then(function () { setPlaying(true); }).catch(function () { setPlaying(false); });
+        } else {
+          setPlaying(!song.paused);
+        }
+      } else {
+        song.pause();
+        setPlaying(false);
+      }
+    });
+
+    song.addEventListener('pause', function () {
+      if (song.currentTime > 0 && !song.ended) setPlaying(false);
+    });
+    song.addEventListener('play', function () { setPlaying(true); });
 
     document.getElementById('honk').addEventListener('click', function () {
-      playSong();
       document.body.classList.remove('yelling');
       void document.body.offsetWidth;
       document.body.classList.add('yelling');

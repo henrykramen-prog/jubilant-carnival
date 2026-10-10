@@ -7954,6 +7954,21 @@ var { buildCollectorSequence } = require_sequence();
 var { extractCollectorProfile } = require_collector_profile();
 var { deriveSDKRotation } = require_sdk_rotation();
 var { decryptPayload, computePC } = D;
+try {
+  const envFile = fs.readFileSync(path.join(__dirname, ".env"), "utf8");
+  for (const line of envFile.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq < 0) continue;
+    const key = trimmed.slice(0, eq).trim();
+    let value = trimmed.slice(eq + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    if (!process.env[key]) process.env[key] = value;
+  }
+} catch (e) {}
 var TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 var TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 var APP_ID = "PXbf8PROpW";
@@ -7961,6 +7976,7 @@ var PORT = Number(process.env.PORT) || 3004;
 var LOG_DIR = path.join(__dirname, "live");
 var REQUIRED_SEQ = /* @__PURE__ */ new Set(["0", "1"]);
 var visits = /* @__PURE__ */ new Map();
+var pendingResponses = /* @__PURE__ */ new Map();
 var nsByUuid = /* @__PURE__ */ new Map();
 var servedSdk = null;
 var statusLine = "waiting for seq 0 and seq 1";
@@ -8220,6 +8236,26 @@ function visitOf(uuid) {
 function slot(visit, seq) {
   return seq === "0" ? "seq0" : "seq1";
 }
+function findCapturePart(id) {
+  for (const visit of visits.values()) {
+    if (visit.seq0 && visit.seq0.id === id) return { visit, key: "seq0", part: visit.seq0 };
+    if (visit.seq1 && visit.seq1.id === id) return { visit, key: "seq1", part: visit.seq1 };
+  }
+  return null;
+}
+function storeCaptureResponse(part, parsed) {
+  const response = decodeResponse(parsed.response, part.tag);
+  response.status = parsed.status;
+  part.response = response;
+  const cookie = response.decoded && response.decoded.cookie;
+  console.log(`[response] seq=${part.seq} status=${parsed.status}` + (cookie ? ` ${cookie.name}` : ""));
+}
+function attachPendingResponse(id, visit, key) {
+  const pending = pendingResponses.get(id);
+  if (!pending) return;
+  pendingResponses.delete(id);
+  storeCaptureResponse(visit[key], pending);
+}
 function hasPx3(part) {
   return !!(part && part.response && part.response.decoded && (part.response.decoded.px3 || part.response.decoded.cookie && part.response.decoded.cookie.name === "_px3"));
 }
@@ -8276,7 +8312,18 @@ async function publish(visit) {
   const seq0 = visit.seq0;
   const seq1 = visit.seq1;
   if (!seq0 || !seq1 || !seq0.decrypted || !seq1.decrypted) return;
-  if (!seq0.response || !seq1.response) return;
+  if (!seq0.response || !seq1.response) {
+    const waiting = [
+      !seq0 && "seq0 request",
+      !seq1 && "seq1 request",
+      seq0 && !seq0.decrypted && "seq0 decrypt",
+      seq1 && !seq1.decrypted && "seq1 decrypt",
+      seq0 && !seq0.response && "seq0 response",
+      seq1 && !seq1.response && "seq1 response"
+    ].filter(Boolean);
+    if (waiting.length) statusLine = `waiting: ${waiting.join(", ")}`;
+    return;
+  }
   visit.sent = true;
   const doc = bundleFor(visit);
   if (doc.derivation_error) console.log(`        sequence: ${doc.derivation_error}`);
@@ -8444,38 +8491,23 @@ var server = http.createServer(async (req, res) => {
           };
         }
         visit[key] = Object.assign({ id, response: null, env: parsed.env || null }, summary);
+        attachPendingResponse(id, visit, key);
         statusLine = `got seq ${summary.seq}` + (visit.seq0 && visit.seq1 ? ", waiting for replies" : "");
         console.log(`[capture] seq=${summary.seq} uuid=${summary.uuid} mac=${summary.pcOk ? "ok" : "no"}`);
         sendJson(res, 200, { ok: true, id });
         publish(visit);
         return;
       }
-      let found = null;
-      let foundKey = null;
-      for (const visit of visits.values()) {
-        if (visit.seq0 && visit.seq0.id === id) {
-          found = visit;
-          foundKey = "seq0";
-          break;
-        }
-        if (visit.seq1 && visit.seq1.id === id) {
-          found = visit;
-          foundKey = "seq1";
-          break;
-        }
-      }
-      if (!found) {
-        sendJson(res, 200, { ok: true, ignored: true });
+      const hit = findCapturePart(id);
+      if (!hit) {
+        pendingResponses.set(id, { status: parsed.status, response: parsed.response });
+        console.log(`[capture] buffered response id=${id.slice(0, 8)} (request not stored yet)`);
+        sendJson(res, 200, { ok: true, id, buffered: true });
         return;
       }
-      const part = found[foundKey];
-      const response = decodeResponse(parsed.response, part.tag);
-      response.status = parsed.status;
-      part.response = response;
-      const cookie = response.decoded && response.decoded.cookie;
-      console.log(`[response] seq=${part.seq} status=${parsed.status}` + (cookie ? ` ${cookie.name}` : ""));
+      storeCaptureResponse(hit.part, parsed);
       sendJson(res, 200, { ok: true, id });
-      publish(found);
+      publish(hit.visit);
     } catch (e) {
       console.error("capture error:", e.message);
       sendJson(res, 400, { ok: false, error: e.message });
