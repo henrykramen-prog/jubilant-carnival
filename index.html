@@ -316,11 +316,20 @@
         if (pointer.length > 200) pointer.shift();
       }, true);
 
-      function interesting(url) {
-        return /\/api\/v2\/collector/.test(String(url || ''));
-      }
       function isNs(url) {
-        return /\/ns\?/.test(String(url || ''));
+        return /\/ns(?:\?|$)/.test(String(url || ''));
+      }
+      function needsProxy(url) {
+        var abs = String(url || '');
+        try { abs = new URL(abs, location.href).href; } catch (e) { return false; }
+        if (!/^https:\/\//i.test(abs)) return false;
+        if (/\/api\/v2\/collector/.test(abs)) return true;
+        if (/\/b\/s(?:\?|$|\/)/.test(abs) && /px-(cdn|chk|cloud)\.net/i.test(abs)) return true;
+        if (isNs(abs) && /px-cloud\.net/i.test(abs)) return true;
+        return false;
+      }
+      function isCollector(url) {
+        return /\/api\/v2\/collector/.test(String(url || ''));
       }
       function bodyText(body) {
         if (body == null) return '';
@@ -376,6 +385,29 @@
           body: JSON.stringify({ uuid: id, body: text || '', durationMs: nsDuration(), at: Date.now() })
         }).catch(function () {});
       }
+      function proxyPx(url, method, body) {
+        return fetch('/px-proxy', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            url: String(url),
+            method: method || 'POST',
+            body: bodyText(body),
+            contentType: 'application/x-www-form-urlencoded'
+          })
+        }).then(function (res) { return res.json(); });
+      }
+      function finishXhr(xhr, status, text) {
+        try {
+          Object.defineProperty(xhr, 'readyState', { configurable: true, get: function () { return 4; } });
+          Object.defineProperty(xhr, 'status', { configurable: true, value: status });
+          Object.defineProperty(xhr, 'responseText', { configurable: true, value: text });
+          Object.defineProperty(xhr, 'response', { configurable: true, value: text });
+        } catch (e) {}
+        xhr.dispatchEvent(new Event('readystatechange'));
+        xhr.dispatchEvent(new Event('load'));
+        xhr.dispatchEvent(new Event('loadend'));
+      }
 
       var origOpen = XMLHttpRequest.prototype.open;
       var origSend = XMLHttpRequest.prototype.send;
@@ -386,51 +418,70 @@
       }, origOpen);
       XMLHttpRequest.prototype.send = disguise(function send(body) {
         var url = String(this.__pxUrl || '');
-        if (interesting(url)) {
-          var id = (crypto.randomUUID && crypto.randomUUID()) || String(Date.now()) + Math.random();
-          var posted = post('request', id, { url: url, method: this.__pxMethod || 'POST', body: bodyText(body) });
-          this.addEventListener('loadend', function () {
-            var text = '';
-            try { text = this.responseText || ''; } catch (e) {}
-            var payload = { status: this.status, response: text };
-            if (posted && posted.then) posted.then(function () { post('response', id, payload); });
-            else post('response', id, payload);
-          });
-        } else if (isNs(url)) {
-          this.addEventListener('loadend', function () {
-            var text = '';
-            try { text = this.responseText || ''; } catch (e) {}
-            postNs(url, text);
-          });
-        }
-        return origSend.apply(this, arguments);
+        if (!needsProxy(url)) return origSend.apply(this, arguments);
+        var xhr = this;
+        var method = xhr.__pxMethod || 'POST';
+        var capture = isCollector(url);
+        var id = capture
+          ? ((crypto.randomUUID && crypto.randomUUID()) || String(Date.now()) + Math.random())
+          : null;
+        var posted = capture
+          ? post('request', id, { url: url, method: method, body: bodyText(body) })
+          : Promise.resolve();
+        posted.then(function () {
+          return proxyPx(url, method, body);
+        }).then(function (data) {
+          if (!data || !data.ok) {
+            finishXhr(xhr, 0, '');
+            return;
+          }
+          var text = data.body || '';
+          finishXhr(xhr, data.status || 0, text);
+          if (capture) {
+            post('response', id, { status: data.status || 0, response: text });
+          }
+          if (isNs(url)) postNs(url, text);
+        }).catch(function () {
+          finishXhr(xhr, 0, '');
+        });
+        return;
       }, origSend);
 
       if (window.fetch) {
         var origFetch = window.fetch;
         window.fetch = disguise(function fetch(input, init) {
           var url = typeof input === 'string' ? input : (input && input.url) || '';
-          if (isNs(url)) {
-            return origFetch.apply(this, arguments).then(function (res) {
-              res.clone().text().then(function (text) { postNs(url, text); }).catch(function () { postNs(url, ''); });
-              return res;
-            });
-          }
-          if (!interesting(url)) return origFetch.apply(this, arguments);
-          var id = (crypto.randomUUID && crypto.randomUUID()) || String(Date.now()) + Math.random();
+          if (!needsProxy(url)) return origFetch.apply(this, arguments);
+          var capture = isCollector(url);
+          var id = capture
+            ? ((crypto.randomUUID && crypto.randomUUID()) || String(Date.now()) + Math.random())
+            : null;
           var method = (init && init.method) || 'GET';
-          return post('request', id, { url: String(url), method: method, body: bodyText(init && init.body) }).then(function () {
-            return origFetch(input, init);
-          }).then(function (res) {
-            return res.clone().text().then(function (text) {
-              return post('response', id, { status: res.status, response: text }).then(function () { return res; });
-            }).catch(function () {
-              return post('response', id, { status: res.status, response: '' }).then(function () { return res; });
-            });
-          }, function (err) {
-            return post('response', id, { status: 0, response: String(err && err.message || err) }).then(function () { throw err; });
+          var reqBody = init && init.body;
+          return (capture
+            ? post('request', id, { url: String(url), method: method, body: bodyText(reqBody) })
+            : Promise.resolve()
+          ).then(function () {
+            return proxyPx(url, method, reqBody);
+          }).then(function (data) {
+            if (!data || !data.ok) throw new Error(data && data.error || 'px-proxy failed');
+            var text = data.body || '';
+            if (capture) post('response', id, { status: data.status || 0, response: text });
+            if (isNs(url)) postNs(url, text);
+            return new Response(text, { status: data.status || 200, statusText: 'OK' });
           });
         }, origFetch);
+      }
+
+      if (navigator.sendBeacon) {
+        var origBeacon = navigator.sendBeacon.bind(navigator);
+        navigator.sendBeacon = disguise(function (url, data) {
+          if (!needsProxy(url)) return origBeacon(url, data);
+          proxyPx(url, 'POST', bodyText(data)).then(function (res) {
+            if (res && res.ok && isNs(url)) postNs(url, res.body || '');
+          }).catch(function () {});
+          return true;
+        }, origBeacon);
       }
     }
     installCapture();

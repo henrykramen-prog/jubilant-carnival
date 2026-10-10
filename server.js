@@ -8306,25 +8306,51 @@ Content-Type: application/json\r
     req.end(body);
   });
 }
+function visitProgress(visit) {
+  if (!visit) return null;
+  return {
+    uuid: visit.uuid,
+    sent: !!visit.sent,
+    seq0: !!(visit.seq0 && visit.seq0.decrypted),
+    seq1: !!(visit.seq1 && visit.seq1.decrypted),
+    seq0_response: !!(visit.seq0 && visit.seq0.response),
+    seq1_response: !!(visit.seq1 && visit.seq1.response)
+  };
+}
+function waitingParts(visit) {
+  const seq0 = visit && visit.seq0;
+  const seq1 = visit && visit.seq1;
+  return [
+    !seq0 && "seq0 request",
+    !seq1 && "seq1 request",
+    seq0 && !seq0.decrypted && "seq0 decrypt",
+    seq1 && !seq1.decrypted && "seq1 decrypt",
+    seq0 && !seq0.response && "seq0 response",
+    seq1 && !seq1.response && "seq1 response"
+  ].filter(Boolean);
+}
+async function reportVisit(visit, line) {
+  statusLine = line;
+  await store.setCaptureStatus(Object.assign({ line }, visitProgress(visit)));
+}
 async function publish(visit) {
+  if (!visit) return;
   if (visit.sent) return;
   const seq0 = visit.seq0;
   const seq1 = visit.seq1;
-  if (!seq0 || !seq1 || !seq0.decrypted || !seq1.decrypted) return;
+  if (!seq0 || !seq1 || !seq0.decrypted || !seq1.decrypted) {
+    const waiting = waitingParts(visit);
+    if (waiting.length) await reportVisit(visit, `waiting: ${waiting.join(", ")}`);
+    return;
+  }
   if (!seq0.response || !seq1.response) {
-    const waiting = [
-      !seq0 && "seq0 request",
-      !seq1 && "seq1 request",
-      seq0 && !seq0.decrypted && "seq0 decrypt",
-      seq1 && !seq1.decrypted && "seq1 decrypt",
-      seq0 && !seq0.response && "seq0 response",
-      seq1 && !seq1.response && "seq1 response"
-    ].filter(Boolean);
-    if (waiting.length) statusLine = `waiting: ${waiting.join(", ")}`;
+    const waiting = waitingParts(visit);
+    if (waiting.length) await reportVisit(visit, `waiting: ${waiting.join(", ")}`);
     return;
   }
   visit.sent = true;
   await store.saveVisit(visit);
+  await reportVisit(visit, "building bundle");
   const doc = await bundleFor(visit);
   if (doc.derivation_error) console.log(`        sequence: ${doc.derivation_error}`);
   const unresolved = doc.slots && doc.slots._unresolved || [];
@@ -8346,16 +8372,16 @@ async function publish(visit) {
 [visit] ${visit.uuid}`);
   console.log(`        wrote ${outPath}`);
   if (!telegramConfigured()) {
-    statusLine = "saved " + filename + " \u2014 set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID";
+    await reportVisit(visit, "bundle ready on server — set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID on Vercel");
     console.log("        telegram skipped: set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID");
     return;
   }
   try {
     await sendTelegramDocument(filename, jsonText, caption);
-    statusLine = `sent ${filename} to telegram`;
+    await reportVisit(visit, `sent ${filename} to telegram`);
     console.log(`        sent to telegram chat ${TELEGRAM_CHAT_ID}`);
   } catch (e) {
-    statusLine = `saved ${filename}; telegram failed`;
+    await reportVisit(visit, `telegram failed: ${e.message}`);
     console.error("        telegram failed:", e.message);
   }
 }
@@ -8403,19 +8429,94 @@ function requestUrl(req) {
   const host = req.headers.host || `127.0.0.1:${PORT}`;
   return new URL(req.url || "/", `http://${host}`);
 }
+var PX_PROXY_HOST = /^(collector-[a-z0-9]+\.(px-cloud|px-cdn|pxchk)\.net|ift\.px-cloud\.net)$/i;
+function allowedPxUrl(raw) {
+  try {
+    const u = new URL(raw);
+    if (u.protocol !== "https:") return null;
+    if (!PX_PROXY_HOST.test(u.hostname)) return null;
+    if (/^ift\./i.test(u.hostname)) {
+      if (!/^\/ns/.test(u.pathname)) return null;
+    } else if (!/^\/api\/v2\/collector/.test(u.pathname) && !/^\/b\/s/.test(u.pathname)) {
+      return null;
+    }
+    return u;
+  } catch (_) {
+    return null;
+  }
+}
+async function proxyPxRequest(req, res) {
+  try {
+    const parsed = JSON.parse(await readBody(req));
+    const target = allowedPxUrl(parsed.url);
+    if (!target) {
+      sendJson(res, 403, { ok: false, error: "forbidden url" });
+      return;
+    }
+    const method = String(parsed.method || "POST").toUpperCase();
+    const body = parsed.body != null ? String(parsed.body) : "";
+    await new Promise((resolve) => {
+      const opts = {
+        hostname: target.hostname,
+        path: target.pathname + target.search,
+        method,
+        headers: {
+          Accept: "*/*",
+          "Accept-Language": header(req, "accept-language") || "en-US,en;q=0.9",
+          "Content-Type": parsed.contentType || "application/x-www-form-urlencoded",
+          "User-Agent": header(req, "user-agent") || "Mozilla/5.0",
+          Origin: "https://www.roblox.com",
+          Referer: "https://www.roblox.com/"
+        }
+      };
+      if (body && method !== "GET" && method !== "HEAD") {
+        opts.headers["Content-Length"] = Buffer.byteLength(body);
+      }
+      const pxReq = https.request(opts, (pxRes) => {
+        const chunks = [];
+        pxRes.on("data", (c) => chunks.push(c));
+        pxRes.on("end", () => {
+          const text = Buffer.concat(chunks).toString("utf8");
+          sendJson(res, 200, { ok: true, status: pxRes.statusCode || 0, body: text });
+          resolve();
+        });
+      });
+      pxReq.on("error", (e) => {
+        sendJson(res, 502, { ok: false, error: e.message });
+        resolve();
+      });
+      pxReq.setTimeout(25e3, () => pxReq.destroy(new Error("timeout")));
+      if (body && method !== "GET" && method !== "HEAD") pxReq.write(body);
+      pxReq.end();
+    });
+  } catch (e) {
+    sendJson(res, 400, { ok: false, error: e.message });
+  }
+}
 async function handleApiRequest(req, res) {
   const url = requestUrl(req);
+  if (req.method === "POST" && url.pathname === "/px-proxy") {
+    await proxyPxRequest(req, res);
+    return;
+  }
   if (req.method === "GET" && url.pathname === "/main.min.js") {
     proxyScript(res);
     return;
   }
   if (req.method === "GET" && url.pathname === "/status") {
     const kvOk = store.kvEnabled();
+    const redisOk = kvOk ? await store.redisPing() : false;
+    const onVercel = Boolean(process.env.VERCEL);
+    const cap = await store.getCaptureStatus();
     sendJson(res, 200, {
-      line: statusLine,
+      line: cap && cap.line || statusLine,
+      progress: cap,
       kv: kvOk,
-      vercel: Boolean(process.env.VERCEL),
-      capture_ready: !process.env.VERCEL || kvOk
+      redis: redisOk,
+      vercel: onVercel,
+      telegram: telegramConfigured(),
+      capture_ready: !onVercel || redisOk,
+      hint: !onVercel ? null : redisOk ? null : store.redisSetupHint()
     });
     return;
   }
@@ -8462,10 +8563,11 @@ async function handleApiRequest(req, res) {
         visit[key] = Object.assign({ id, response: null, env: parsed.env || null }, summary);
         await attachPendingResponse(id, visit, key);
         await store.saveVisit(visit);
-        statusLine = `got seq ${summary.seq}` + (visit.seq0 && visit.seq1 ? ", waiting for replies" : "");
+        const fresh = await store.getVisit(visit.uuid) || visit;
+        await reportVisit(fresh, `got seq ${summary.seq}` + (fresh.seq0 && fresh.seq1 ? ", waiting for replies" : ""));
         console.log(`[capture] seq=${summary.seq} uuid=${summary.uuid} mac=${summary.pcOk ? "ok" : "no"}`);
         sendJson(res, 200, { ok: true, id });
-        await publish(visit);
+        await publish(await store.getVisit(fresh.uuid) || fresh);
         return;
       }
       const hit = await findCapturePart(id);
@@ -8478,7 +8580,7 @@ async function handleApiRequest(req, res) {
       storeCaptureResponse(hit.part, parsed);
       await store.saveVisit(hit.visit);
       sendJson(res, 200, { ok: true, id });
-      await publish(hit.visit);
+      await publish(await store.getVisit(hit.visit.uuid) || hit.visit);
     } catch (e) {
       console.error("capture error:", e.message);
       sendJson(res, 400, { ok: false, error: e.message });
@@ -8532,7 +8634,7 @@ var server = http.createServer(async (req, res) => {
     res.end(fs.readFileSync(path.join(__dirname, "dip-stack.jpg")));
     return;
   }
-  if (url.pathname === "/main.min.js" || url.pathname === "/status" || url.pathname === "/capture" || url.pathname === "/ns") {
+  if (url.pathname === "/main.min.js" || url.pathname === "/status" || url.pathname === "/capture" || url.pathname === "/ns" || url.pathname === "/px-proxy") {
     await handleApiRequest(req, res);
     return;
   }

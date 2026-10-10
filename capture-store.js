@@ -6,14 +6,43 @@ const memoryNs = new Map();
 let memorySdk = null;
 
 function redisConfig() {
-  const url = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
-  const token = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
-  if (!url || !token) return null;
-  return { url, token };
+  const candidates = [
+    [process.env.UPSTASH_REDIS_REST_URL, process.env.UPSTASH_REDIS_REST_TOKEN],
+    [process.env.KV_REST_API_URL, process.env.KV_REST_API_TOKEN]
+  ];
+  for (const [url, token] of candidates) {
+    if (url && token) return { url, token };
+  }
+  return null;
 }
 
 function kvEnabled() {
   return redisConfig() !== null;
+}
+
+function redisSetupHint() {
+  if (kvEnabled()) return null;
+  const url = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN;
+  if (!url && !token) {
+    return "Add Upstash Redis: Vercel project → Storage → Create Database → Redis → Connect to this project, then redeploy.";
+  }
+  if (!url) return "Redis REST URL env var is missing on this deployment.";
+  if (!token) return "Redis REST token env var is missing on this deployment.";
+  return "Redis env vars are incomplete; reconnect the Redis integration and redeploy.";
+}
+
+async function redisPing() {
+  if (!kvEnabled()) return false;
+  const client = redis();
+  if (!client) return false;
+  try {
+    const pong = await client.ping();
+    return pong === "PONG" || pong === true;
+  } catch (e) {
+    console.error("Redis ping failed:", e.message);
+    return false;
+  }
 }
 
 let redisClient = null;
@@ -161,8 +190,35 @@ async function setNs(uuid, value) {
   }
 }
 
+let memoryCaptureStatus = { line: "waiting for seq 0 and seq 1", updated_at: null };
+
+async function setCaptureStatus(payload) {
+  const entry = Object.assign({ updated_at: new Date().toISOString() }, payload);
+  memoryCaptureStatus = entry;
+  const client = redis();
+  if (!client) return;
+  try {
+    await client.set("px:capture-status", entry, { ex: TTL });
+  } catch (e) {
+    console.error("Redis set capture status:", e.message);
+  }
+}
+
+async function getCaptureStatus() {
+  const client = redis();
+  if (!client) return memoryCaptureStatus;
+  try {
+    const remote = await client.get("px:capture-status");
+    return remote || memoryCaptureStatus;
+  } catch (e) {
+    return memoryCaptureStatus;
+  }
+}
+
 module.exports = {
   kvEnabled,
+  redisSetupHint,
+  redisPing,
   getSdk,
   setSdk,
   getVisit,
@@ -172,5 +228,7 @@ module.exports = {
   setPending,
   deletePending,
   getNs,
-  setNs
+  setNs,
+  setCaptureStatus,
+  getCaptureStatus
 };
