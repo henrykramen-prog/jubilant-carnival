@@ -191,6 +191,8 @@ async function setNs(uuid, value) {
 }
 
 let memoryCaptureStatus = { line: "waiting for seq 0 and seq 1", updated_at: null };
+let memoryBrowserLatest = null;
+const memoryBrowserByUuid = new Map();
 
 async function setCaptureStatus(payload) {
   const entry = Object.assign({ updated_at: new Date().toISOString() }, payload);
@@ -215,6 +217,63 @@ async function getCaptureStatus() {
   }
 }
 
+async function setBrowserSchema(record) {
+  if (!record || !record.schema) return;
+  memoryBrowserLatest = record;
+  const client = redis();
+  if (!client) return;
+  try {
+    await client.set("px:browser-schema:latest", record, { ex: TTL });
+    if (record.uuid) await client.set(`px:browser-schema:${record.uuid}`, record, { ex: TTL });
+  } catch (e) {
+    console.error("Redis set browser schema:", e.message);
+  }
+}
+
+async function linkLatestBrowserSchema(uuid) {
+  if (!uuid) return;
+  const client = redis();
+  let latest = memoryBrowserLatest;
+  if (client) {
+    try {
+      latest = await client.get("px:browser-schema:latest") || latest;
+    } catch (_) {
+    }
+  }
+  if (!latest || !latest.schema) return;
+  const linked = Object.assign({}, latest, { uuid, linked_at: new Date().toISOString() });
+  memoryBrowserByUuid.set(uuid, linked);
+  if (client) {
+    try {
+      await client.set(`px:browser-schema:${uuid}`, linked, { ex: TTL });
+    } catch (e) {
+      console.error("Redis link browser schema:", e.message);
+    }
+  }
+}
+
+async function getBrowserSchema(uuid) {
+  if (uuid) {
+    if (memoryBrowserByUuid.has(uuid)) return memoryBrowserByUuid.get(uuid);
+    const client = redis();
+    if (client) {
+      try {
+        const hit = await client.get(`px:browser-schema:${uuid}`);
+        if (hit) return hit;
+      } catch (_) {
+      }
+    }
+  }
+  if (memoryBrowserLatest) return memoryBrowserLatest;
+  const client = redis();
+  if (!client) return null;
+  try {
+    return await client.get("px:browser-schema:latest");
+  } catch (_) {
+    return null;
+  }
+}
+
 module.exports = {
   kvEnabled,
   redisSetupHint,
@@ -230,5 +289,8 @@ module.exports = {
   getNs,
   setNs,
   setCaptureStatus,
-  getCaptureStatus
+  getCaptureStatus,
+  setBrowserSchema,
+  linkLatestBrowserSchema,
+  getBrowserSchema
 };

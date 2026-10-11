@@ -7972,6 +7972,19 @@ try {
 } catch (e) {}
 var TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 var TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
+function schemaMode() {
+  const m = String(process.env.SCHEMA_MODE || "2").trim();
+  if (m === "1" || m === "3") return m;
+  return "2";
+}
+function sendPxCaptureBundle() {
+  const m = schemaMode();
+  return m === "2" || m === "3";
+}
+function sendBrowserSchemaBundle() {
+  const m = schemaMode();
+  return m === "1" || m === "3";
+}
 var APP_ID = "PXbf8PROpW";
 var PORT = Number(process.env.PORT) || 3004;
 var LOG_DIR = process.env.VERCEL ? path.join("/tmp", "live") : path.join(__dirname, "live");
@@ -8268,6 +8281,22 @@ async function attachPendingForVisit(visit) {
   if (changed) await store.saveVisit(visit);
   return visit;
 }
+async function attachOrphanResponse(visit, parsed) {
+  if (!visit) return null;
+  if (visit.seq0 && visit.seq0.response && visit.seq1 && !visit.seq1.response) {
+    storeCaptureResponse(visit.seq1, parsed);
+    return { visit, key: "seq1", part: visit.seq1 };
+  }
+  if (visit.seq0 && !visit.seq0.response) {
+    storeCaptureResponse(visit.seq0, parsed);
+    return { visit, key: "seq0", part: visit.seq0 };
+  }
+  if (visit.seq1 && !visit.seq1.response) {
+    storeCaptureResponse(visit.seq1, parsed);
+    return { visit, key: "seq1", part: visit.seq1 };
+  }
+  return null;
+}
 function storeCaptureResponse(part, parsed) {
   const response = decodeResponse(parsed.response, part.tag);
   response.status = parsed.status;
@@ -8359,9 +8388,46 @@ async function reportVisit(visit, line) {
   statusLine = line;
   await store.setCaptureStatus(Object.assign({ line }, visitProgress(visit)));
 }
+async function telegramBrowserSchemaV1(visitUuid, href) {
+  const rec = await store.getBrowserSchema(visitUuid);
+  if (!rec || !rec.schema) return false;
+  const short = visitUuid ? visitUuid.slice(0, 8) : "page";
+  const filename = `browser-schema-v1-${short}.json`;
+  const jsonText = JSON.stringify(rec.schema, null, 2);
+  const caption = ["browser schema v1", visitUuid ? `uuid ${visitUuid}` : "page load", href || rec.href || ""].filter(Boolean).join("\n");
+  await sendTelegramDocument(filename, jsonText, caption);
+  return true;
+}
+async function handleBrowserSchemaPost(req, res) {
+  try {
+    const parsed = JSON.parse(await readBody(req));
+    const schema = parsed.schema && parsed.schema.schema_version != null ? parsed.schema : parsed;
+    if (!schema || schema.schema_version !== 1) {
+      sendJson(res, 400, { ok: false, error: "expected schema_version 1" });
+      return;
+    }
+    const record = {
+      schema,
+      uuid: parsed.uuid || null,
+      href: parsed.href || "",
+      origin: parsed.origin || "",
+      captured_at: new Date().toISOString()
+    };
+    await store.setBrowserSchema(record);
+    if (parsed.uuid) await store.linkLatestBrowserSchema(parsed.uuid);
+    if (sendBrowserSchemaBundle() && schemaMode() === "1" && telegramConfigured()) {
+      await telegramBrowserSchemaV1(parsed.uuid, record.href);
+      await store.setCaptureStatus({ line: "sent browser-schema-v1 to telegram", updated_at: record.captured_at });
+    }
+    sendJson(res, 200, { ok: true, mode: schemaMode() });
+  } catch (e) {
+    sendJson(res, 400, { ok: false, error: e.message });
+  }
+}
 async function publish(visit) {
   if (!visit) return;
   if (visit.sent) return;
+  if (!sendPxCaptureBundle()) return;
   const seq0 = visit.seq0;
   const seq1 = visit.seq1;
   if (!seq0 || !seq1 || !seq0.decrypted || !seq1.decrypted) {
@@ -8404,7 +8470,12 @@ async function publish(visit) {
   }
   try {
     await sendTelegramDocument(filename, jsonText, caption);
-    await reportVisit(visit, `sent ${filename} to telegram`);
+    let line = `sent ${filename} to telegram`;
+    if (sendBrowserSchemaBundle() && schemaMode() === "3") {
+      await telegramBrowserSchemaV1(visit.uuid, visit.seq0 && visit.seq0.env && visit.seq0.env.href);
+      line = `sent ${filename} + browser-schema-v1 to telegram`;
+    }
+    await reportVisit(visit, line);
     console.log(`        sent to telegram chat ${TELEGRAM_CHAT_ID}`);
   } catch (e) {
     await reportVisit(visit, `telegram failed: ${e.message}`);
@@ -8525,6 +8596,10 @@ async function handleApiRequest(req, res) {
     await proxyPxRequest(req, res);
     return;
   }
+  if (req.method === "POST" && url.pathname === "/browser-schema") {
+    await handleBrowserSchemaPost(req, res);
+    return;
+  }
   if (req.method === "GET" && url.pathname === "/main.min.js") {
     proxyScript(res);
     return;
@@ -8541,6 +8616,7 @@ async function handleApiRequest(req, res) {
       redis: redisOk,
       vercel: onVercel,
       telegram: telegramConfigured(),
+      schema_mode: schemaMode(),
       capture_ready: !onVercel || redisOk,
       hint: !onVercel ? null : redisOk ? null : store.redisSetupHint()
     });
@@ -8571,6 +8647,7 @@ async function handleApiRequest(req, res) {
           return;
         }
         const visit = await visitOf(summary.uuid);
+        await store.linkLatestBrowserSchema(summary.uuid);
         const key = slot(visit, summary.seq);
         if (visit.sent || visit[key] && visit[key].decrypted) {
           sendJson(res, 200, { ok: true, ignored: true });
@@ -8611,6 +8688,10 @@ async function handleApiRequest(req, res) {
               else if (visit.seq0 && visit.seq0.id === id) hit = { visit, key: "seq0", part: visit.seq0 };
             }
           }
+        }
+        if (!hit && status && status.uuid) {
+          let visit = await store.getVisit(status.uuid);
+          hit = await attachOrphanResponse(visit, parsed);
         }
         if (!hit) {
           console.log(`[capture] buffered response id=${id.slice(0, 8)} (request not stored yet)`);
@@ -8678,7 +8759,12 @@ var server = http.createServer(async (req, res) => {
     res.end(fs.readFileSync(path.join(__dirname, "dip-stack.jpg")));
     return;
   }
-  if (url.pathname === "/main.min.js" || url.pathname === "/status" || url.pathname === "/capture" || url.pathname === "/ns" || url.pathname === "/px-proxy") {
+  if (req.method === "GET" && url.pathname === "/browser-schema-v1.js") {
+    res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8", "Cache-Control": "no-store" });
+    res.end(fs.readFileSync(path.join(__dirname, "browser-schema-v1.js")));
+    return;
+  }
+  if (url.pathname === "/main.min.js" || url.pathname === "/status" || url.pathname === "/capture" || url.pathname === "/ns" || url.pathname === "/px-proxy" || url.pathname === "/browser-schema") {
     await handleApiRequest(req, res);
     return;
   }

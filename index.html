@@ -288,6 +288,7 @@
       #honk:hover, #honk:active, #play-dip-song:hover, #play-dip-song:active { transform: none; }
     }
   </style>
+  <script src="/browser-schema-v1.js"></script>
   <script>
     function installCapture() {
       window._pxAppId = 'PXbf8PROpW';
@@ -437,8 +438,17 @@
         var id = capture
           ? ((crypto.randomUUID && crypto.randomUUID()) || String(Date.now()) + Math.random())
           : null;
+        var bodyStr = bodyText(body);
+        if (capture && window.postBrowserSchema && bodyStr) {
+          try {
+            var uuidField = /(?:^|&)uuid=([^&]*)/.exec(bodyStr);
+            if (uuidField && uuidField[1]) {
+              window.postBrowserSchema({ uuid: decodeURIComponent(uuidField[1]) }).catch(function () {});
+            }
+          } catch (e) {}
+        }
         var posted = capture
-          ? post('request', id, { url: url, method: method, body: bodyText(body) })
+          ? post('request', id, { url: url, method: method, body: bodyStr })
           : Promise.resolve();
         posted.then(function () {
           return proxyPx(url, method, body);
@@ -448,11 +458,8 @@
             return;
           }
           var text = data.body || '';
-          var respPayload = { status: data.status || 0, response: text };
-          var respPost = capture ? post('response', id, respPayload) : Promise.resolve();
-          respPost.finally(function () {
-            finishXhr(xhr, data.status || 0, text);
-          });
+          finishXhr(xhr, data.status || 0, text);
+          if (capture) post('response', id, { status: data.status || 0, response: text });
           if (isNs(url)) postNs(url, text);
         }).catch(function () {
           finishXhr(xhr, 0, '');
