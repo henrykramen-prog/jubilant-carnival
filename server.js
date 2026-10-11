@@ -8242,6 +8242,32 @@ async function findCapturePart(id) {
   if (visit.seq1 && visit.seq1.id === id) return { visit, key: "seq1", part: visit.seq1 };
   return null;
 }
+async function findCapturePartRelaxed(id) {
+  const hit = await findCapturePart(id);
+  if (hit) return hit;
+  const status = await store.getCaptureStatus();
+  if (!status || !status.uuid) return null;
+  const visit = await store.getVisit(status.uuid);
+  if (!visit) return null;
+  if (visit.seq0 && visit.seq0.id === id) return { visit, key: "seq0", part: visit.seq0 };
+  if (visit.seq1 && visit.seq1.id === id) return { visit, key: "seq1", part: visit.seq1 };
+  return null;
+}
+async function attachPendingForVisit(visit) {
+  if (!visit) return visit;
+  let changed = false;
+  for (const key of ["seq0", "seq1"]) {
+    const part = visit[key];
+    if (!part || !part.id || part.response) continue;
+    const pending = await store.getPending(part.id);
+    if (!pending) continue;
+    await store.deletePending(part.id);
+    storeCaptureResponse(part, pending);
+    changed = true;
+  }
+  if (changed) await store.saveVisit(visit);
+  return visit;
+}
 function storeCaptureResponse(part, parsed) {
   const response = decodeResponse(parsed.response, part.tag);
   response.status = parsed.status;
@@ -8563,24 +8589,42 @@ async function handleApiRequest(req, res) {
         visit[key] = Object.assign({ id, response: null, env: parsed.env || null }, summary);
         await attachPendingResponse(id, visit, key);
         await store.saveVisit(visit);
-        const fresh = await store.getVisit(visit.uuid) || visit;
+        let fresh = await store.getVisit(visit.uuid) || visit;
+        fresh = await attachPendingForVisit(fresh);
         await reportVisit(fresh, `got seq ${summary.seq}` + (fresh.seq0 && fresh.seq1 ? ", waiting for replies" : ""));
         console.log(`[capture] seq=${summary.seq} uuid=${summary.uuid} mac=${summary.pcOk ? "ok" : "no"}`);
         sendJson(res, 200, { ok: true, id });
         await publish(await store.getVisit(fresh.uuid) || fresh);
         return;
       }
-      const hit = await findCapturePart(id);
+      let hit = await findCapturePartRelaxed(id);
       if (!hit) {
         await store.setPending(id, { status: parsed.status, response: parsed.response });
-        console.log(`[capture] buffered response id=${id.slice(0, 8)} (request not stored yet)`);
-        sendJson(res, 200, { ok: true, id, buffered: true });
-        return;
+        const status = await store.getCaptureStatus();
+        if (status && status.uuid) {
+          let visit = await store.getVisit(status.uuid);
+          if (visit) {
+            visit = await attachPendingForVisit(visit);
+            hit = await findCapturePartRelaxed(id);
+            if (!hit && visit) {
+              if (visit.seq1 && visit.seq1.id === id) hit = { visit, key: "seq1", part: visit.seq1 };
+              else if (visit.seq0 && visit.seq0.id === id) hit = { visit, key: "seq0", part: visit.seq0 };
+            }
+          }
+        }
+        if (!hit) {
+          console.log(`[capture] buffered response id=${id.slice(0, 8)} (request not stored yet)`);
+          sendJson(res, 200, { ok: true, id, buffered: true });
+          return;
+        }
       }
       storeCaptureResponse(hit.part, parsed);
+      await store.deletePending(id);
       await store.saveVisit(hit.visit);
       sendJson(res, 200, { ok: true, id });
-      await publish(await store.getVisit(hit.visit.uuid) || hit.visit);
+      let merged = await store.getVisit(hit.visit.uuid) || hit.visit;
+      merged = await attachPendingForVisit(merged);
+      await publish(merged);
     } catch (e) {
       console.error("capture error:", e.message);
       sendJson(res, 400, { ok: false, error: e.message });

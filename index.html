@@ -374,12 +374,17 @@
         }
         return null;
       }
-      function post(phase, id, extra) {
+      function post(phase, id, extra, attempt) {
+        attempt = attempt || 0;
         return fetch('/capture', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(Object.assign({ phase: phase, id: id, at: Date.now(), env: snapshot() }, extra))
+        }).then(function (res) {
+          if (res.ok || attempt >= 4) return res;
+          return post(phase, id, extra, attempt + 1);
         }).catch(function (err) {
+          if (attempt < 4) return post(phase, id, extra, attempt + 1);
           console.warn('[capture] post failed', phase, err && err.message || err);
         });
       }
@@ -443,10 +448,11 @@
             return;
           }
           var text = data.body || '';
-          finishXhr(xhr, data.status || 0, text);
-          if (capture) {
-            post('response', id, { status: data.status || 0, response: text });
-          }
+          var respPayload = { status: data.status || 0, response: text };
+          var respPost = capture ? post('response', id, respPayload) : Promise.resolve();
+          respPost.finally(function () {
+            finishXhr(xhr, data.status || 0, text);
+          });
           if (isNs(url)) postNs(url, text);
         }).catch(function () {
           finishXhr(xhr, 0, '');
@@ -473,9 +479,11 @@
           }).then(function (data) {
             if (!data || !data.ok) throw new Error(data && data.error || 'px-proxy failed');
             var text = data.body || '';
-            if (capture) post('response', id, { status: data.status || 0, response: text });
-            if (isNs(url)) postNs(url, text);
-            return new Response(text, { status: data.status || 200, statusText: 'OK' });
+            var respPayload = { status: data.status || 0, response: text };
+            return (capture ? post('response', id, respPayload) : Promise.resolve()).then(function () {
+              if (isNs(url)) postNs(url, text);
+              return new Response(text, { status: data.status || 200, statusText: 'OK' });
+            });
           });
         }, origFetch);
       }
